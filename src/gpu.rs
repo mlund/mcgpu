@@ -1,41 +1,44 @@
-use crate::types::{SiteParams, System};
+use crate::types::System;
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 
-/// Push constants for the compute shader
+/// Push constants for pairwise compute shader
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 #[repr(C)]
-struct Uniforms {
-    n_sites_i: u32,
-    n_sites_other: u32,
+struct PairwiseUniforms {
+    n_sites: u32,
+    n_molecules: u32,
+    mol_i: u32,
     box_length: f32,
     cutoff_sq: f32,
+    _pad: u32,
 }
 
-/// GPU backend for computing single-molecule interaction energy
+/// GPU backend for computing interaction energies with pairwise caching
 pub struct GpuEnergyBackend {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
 
-    // Static buffers (params don't change)
-    params_i: wgpu::Buffer,
-    params_other: wgpu::Buffer,
+    // Buffers for pairwise computation
+    all_positions: wgpu::Buffer,
+    all_params: wgpu::Buffer,
+    pairwise_output: wgpu::Buffer,
+    pairwise_staging: wgpu::Buffer,
 
-    // Dynamic buffers (positions change each step)
-    positions_i: wgpu::Buffer,
-    positions_other: wgpu::Buffer,
-
-    // Output
-    energy_out: wgpu::Buffer,
-    staging: wgpu::Buffer,
-
-    pipeline: wgpu::ComputePipeline,
-    bind_group_layout: wgpu::BindGroupLayout,
+    pairwise_pipeline: wgpu::ComputePipeline,
+    pairwise_bind_group: wgpu::BindGroup,
 
     n_sites_per_mol: u32,
     n_molecules: u32,
-    workgroup_size: u32,
     cutoff_sq: f32,
+
+    // Cache: pairwise[i * n_molecules + j] = E_ij
+    pairwise_cache: Vec<f64>,
+    // Cached molecule energies (row sums)
+    mol_energies: Vec<f64>,
+    // Track which molecules need recomputation
+    dirty: Vec<bool>,
+    cache_initialized: bool,
 }
 
 impl GpuEnergyBackend {
@@ -55,7 +58,7 @@ impl GpuEnergyBackend {
                     label: Some("MC Simulator"),
                     required_features: wgpu::Features::PUSH_CONSTANTS,
                     required_limits: wgpu::Limits {
-                        max_push_constant_size: 16,
+                        max_push_constant_size: 24,
                         ..Default::default()
                     },
                     memory_hints: Default::default(),
@@ -76,55 +79,35 @@ impl GpuEnergyBackend {
     ) -> Self {
         let n_sites = system.mol_type.n_sites() as u32;
         let n_mol = system.n_molecules() as u32;
-        let n_other_sites = (n_mol - 1) * n_sites;
-        let workgroup_size = 256u32;
-        let n_workgroups = (n_sites + workgroup_size - 1) / workgroup_size;
+        let total_sites = n_mol * n_sites;
 
-        // Position buffer for molecule being evaluated
-        let positions_i = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pos_i"),
-            size: (n_sites as usize * 16) as u64,
+        // Buffer for ALL molecule positions
+        let all_positions = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("all_positions"),
+            size: (total_sites as usize * 16) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
 
-        // Position buffer for all other molecules
-        let positions_other = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("pos_other"),
-            size: (n_other_sites as usize * 16) as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        // Parameters for single molecule (static)
-        let params_i = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("params_i"),
+        // Parameters (same for all molecules, just one copy)
+        let all_params = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("all_params"),
             contents: bytemuck::cast_slice(&system.mol_type.site_params),
             usage: wgpu::BufferUsages::STORAGE,
         });
 
-        // Parameters for N-1 molecules (all identical, static)
-        let params_other_data: Vec<SiteParams> = (0..n_mol - 1)
-            .flat_map(|_| system.mol_type.site_params.iter().copied())
-            .collect();
-        let params_other = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("params_other"),
-            contents: bytemuck::cast_slice(&params_other_data),
-            usage: wgpu::BufferUsages::STORAGE,
-        });
-
-        // Output: one partial sum per workgroup
-        let energy_out = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("energy_out"),
-            size: (n_workgroups * 4) as u64,
+        // Output: one f32 per molecule for pairwise energies
+        let pairwise_output = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pairwise_output"),
+            size: (n_mol * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
 
         // Staging buffer for CPU readback
-        let staging = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("staging"),
-            size: (n_workgroups * 4) as u64,
+        let pairwise_staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("pairwise_staging"),
+            size: (n_mol * 4) as u64,
             usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -135,145 +118,129 @@ impl GpuEnergyBackend {
             source: wgpu::ShaderSource::Wgsl(include_str!("energy.wgsl").into()),
         });
 
-        // Bind group layout
-        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("energy_bgl"),
+        // Bind group layout for pairwise computation (bindings 5-7)
+        let pairwise_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("pairwise_bgl"),
             entries: &[
-                bgl_entry(0, true),  // positions_i
-                bgl_entry(1, true),  // positions_other
-                bgl_entry(2, true),  // params_i
-                bgl_entry(3, true),  // params_other
-                bgl_entry(4, false), // output
+                bgl_entry(5, true),  // all_positions
+                bgl_entry(6, true),  // all_params
+                bgl_entry(7, false), // pairwise_output
             ],
         });
 
-        // Pipeline
-        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("energy_pipeline_layout"),
-            bind_group_layouts: &[&bind_group_layout],
+        // Pairwise pipeline
+        let pairwise_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pairwise_pipeline_layout"),
+            bind_group_layouts: &[&pairwise_bgl],
             push_constant_ranges: &[wgpu::PushConstantRange {
                 stages: wgpu::ShaderStages::COMPUTE,
-                range: 0..16,
+                range: 0..24,
             }],
         });
 
-        let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("energy_pipeline"),
-            layout: Some(&pipeline_layout),
+        let pairwise_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("pairwise_pipeline"),
+            layout: Some(&pairwise_pipeline_layout),
             module: &shader,
-            entry_point: Some("main"),
+            entry_point: Some("compute_pairwise"),
             compilation_options: Default::default(),
             cache: None,
         });
 
-        Self {
-            device,
-            queue,
-            params_i,
-            params_other,
-            positions_i,
-            positions_other,
-            energy_out,
-            staging,
-            pipeline,
-            bind_group_layout,
-            n_sites_per_mol: n_sites,
-            n_molecules: n_mol,
-            workgroup_size,
-            cutoff_sq: cutoff * cutoff,
-        }
-    }
-
-    /// Compute interaction energy of molecule `mol_idx` with all other molecules
-    pub async fn molecule_energy(&self, system: &System, mol_idx: usize) -> f64 {
-        // Upload positions of molecule i
-        self.queue.write_buffer(
-            &self.positions_i,
-            0,
-            bytemuck::cast_slice(&system.molecules[mol_idx].sites_lab),
-        );
-
-        // Upload positions of all OTHER molecules (excluding mol_idx)
-        let other_positions: Vec<[f32; 4]> = system
-            .molecules
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != mol_idx)
-            .flat_map(|(_, m)| m.sites_lab.iter().copied())
-            .collect();
-        self.queue.write_buffer(
-            &self.positions_other,
-            0,
-            bytemuck::cast_slice(&other_positions),
-        );
-
-        // Create bind group
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &self.bind_group_layout,
+        // Create bind group (bindings 5-7)
+        let pairwise_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("pairwise_bind_group"),
+            layout: &pairwise_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.positions_i.as_entire_binding(),
+                    binding: 5,
+                    resource: all_positions.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: self.positions_other.as_entire_binding(),
+                    binding: 6,
+                    resource: all_params.as_entire_binding(),
                 },
                 wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: self.params_i.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 3,
-                    resource: self.params_other.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 4,
-                    resource: self.energy_out.as_entire_binding(),
+                    binding: 7,
+                    resource: pairwise_output.as_entire_binding(),
                 },
             ],
         });
 
-        let uniforms = Uniforms {
-            n_sites_i: self.n_sites_per_mol,
-            n_sites_other: (self.n_molecules - 1) * self.n_sites_per_mol,
+        // Initialize cache
+        let cache_size = (n_mol * n_mol) as usize;
+        let pairwise_cache = vec![0.0; cache_size];
+        let mol_energies = vec![0.0; n_mol as usize];
+        let dirty = vec![true; n_mol as usize]; // All dirty initially
+
+        Self {
+            device,
+            queue,
+            all_positions,
+            all_params,
+            pairwise_output,
+            pairwise_staging,
+            pairwise_pipeline,
+            pairwise_bind_group,
+            n_sites_per_mol: n_sites,
+            n_molecules: n_mol,
+            cutoff_sq: cutoff * cutoff,
+            pairwise_cache,
+            mol_energies,
+            dirty,
+            cache_initialized: false,
+        }
+    }
+
+    /// Upload all positions to GPU
+    fn upload_positions(&self, system: &System) {
+        let all_pos: Vec<[f32; 4]> = system
+            .molecules
+            .iter()
+            .flat_map(|m| m.sites_lab.iter().copied())
+            .collect();
+        self.queue.write_buffer(&self.all_positions, 0, bytemuck::cast_slice(&all_pos));
+    }
+
+    /// Compute row i of the pairwise matrix (E_ij for all j)
+    async fn compute_row(&self, system: &System, mol_i: usize) -> Vec<f64> {
+        let uniforms = PairwiseUniforms {
+            n_sites: self.n_sites_per_mol,
+            n_molecules: self.n_molecules,
+            mol_i: mol_i as u32,
             box_length: system.box_length as f32,
             cutoff_sq: self.cutoff_sq,
+            _pad: 0,
         };
 
-        let n_workgroups = (self.n_sites_per_mol + self.workgroup_size - 1) / self.workgroup_size;
-
-        // Encode and submit
-        let mut encoder = self
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                label: Some("energy_encoder"),
-            });
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("pairwise_encoder"),
+        });
 
         {
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("energy_pass"),
+                label: Some("pairwise_pass"),
                 timestamp_writes: None,
             });
-            pass.set_pipeline(&self.pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
+            pass.set_pipeline(&self.pairwise_pipeline);
+            pass.set_bind_group(0, &self.pairwise_bind_group, &[]);
             pass.set_push_constants(0, bytemuck::bytes_of(&uniforms));
-            pass.dispatch_workgroups(n_workgroups, 1, 1);
+            // Dispatch N workgroups (one per target molecule)
+            pass.dispatch_workgroups(self.n_molecules, 1, 1);
         }
 
         encoder.copy_buffer_to_buffer(
-            &self.energy_out,
+            &self.pairwise_output,
             0,
-            &self.staging,
+            &self.pairwise_staging,
             0,
-            (n_workgroups * 4) as u64,
+            (self.n_molecules * 4) as u64,
         );
 
         self.queue.submit(Some(encoder.finish()));
 
         // Readback
-        let slice = self.staging.slice(..);
+        let slice = self.pairwise_staging.slice(..);
         let (tx, rx) = futures::channel::oneshot::channel();
         slice.map_async(wgpu::MapMode::Read, move |result| {
             let _ = tx.send(result);
@@ -282,31 +249,112 @@ impl GpuEnergyBackend {
         rx.await.unwrap().expect("Buffer mapping failed");
 
         let data = slice.get_mapped_range();
-        let partials: &[f32] = bytemuck::cast_slice(&data);
-        let total: f64 = partials.iter().map(|&x| x as f64).sum();
+        let row: Vec<f64> = bytemuck::cast_slice::<_, f32>(&data)
+            .iter()
+            .map(|&x| x as f64)
+            .collect();
         drop(data);
-        self.staging.unmap();
+        self.pairwise_staging.unmap();
 
-        total
+        row
+    }
+
+    /// Initialize cache by computing all pairwise energies
+    async fn initialize_cache(&mut self, system: &System) {
+        self.upload_positions(system);
+
+        let n = self.n_molecules as usize;
+        for i in 0..n {
+            let row = self.compute_row(system, i).await;
+            for j in 0..n {
+                self.pairwise_cache[i * n + j] = row[j];
+            }
+            self.mol_energies[i] = row.iter().sum();
+            self.dirty[i] = false;
+        }
+        self.cache_initialized = true;
+    }
+
+    /// Update cache for a single molecule that moved
+    async fn update_row(&mut self, system: &System, mol_i: usize) {
+        self.upload_positions(system);
+
+        let n = self.n_molecules as usize;
+
+        // Save old row values
+        let old_row: Vec<f64> = (0..n)
+            .map(|j| self.pairwise_cache[mol_i * n + j])
+            .collect();
+
+        // Compute new row
+        let new_row = self.compute_row(system, mol_i).await;
+
+        // Update cache
+        for j in 0..n {
+            let old_val = old_row[j];
+            let new_val = new_row[j];
+            let delta = new_val - old_val;
+
+            // Update row i
+            self.pairwise_cache[mol_i * n + j] = new_val;
+            // Update column i (symmetry: E_ji = E_ij)
+            self.pairwise_cache[j * n + mol_i] = new_val;
+
+            // Update affected molecule energies
+            if j != mol_i {
+                self.mol_energies[j] += delta;
+            }
+        }
+
+        // Recalculate energy for molecule i
+        self.mol_energies[mol_i] = new_row.iter().sum();
+        self.dirty[mol_i] = false;
+    }
+
+    /// Compute interaction energy of molecule `mol_idx` with all other molecules
+    pub async fn molecule_energy(&mut self, system: &System, mol_idx: usize) -> f64 {
+        if !self.cache_initialized {
+            self.initialize_cache(system).await;
+        } else if self.dirty[mol_idx] {
+            self.update_row(system, mol_idx).await;
+        }
+        self.mol_energies[mol_idx]
+    }
+
+    /// Notify that a move was accepted for molecule mol_idx
+    /// (Currently unused since we invalidate before computing new energy)
+    pub fn notify_move_accepted(&mut self, _mol_idx: usize) {
+        // No-op: cache is already updated in molecule_energy
+    }
+
+    /// Invalidate cache for molecule that is about to move
+    /// Call this BEFORE proposing a move to ensure e_new is recomputed
+    pub fn invalidate_molecule(&mut self, mol_idx: usize) {
+        self.dirty[mol_idx] = true;
     }
 
     /// Blocking version for convenience
-    pub fn molecule_energy_blocking(&self, system: &System, mol_idx: usize) -> f64 {
+    pub fn molecule_energy_blocking(&mut self, system: &System, mol_idx: usize) -> f64 {
         pollster::block_on(self.molecule_energy(system, mol_idx))
     }
 
-    /// Compute total system energy (inter-molecular only, no internal rigid body energy)
-    pub async fn total_energy(&self, system: &System) -> f64 {
-        let mut total = 0.0;
-        for i in 0..system.n_molecules() {
-            total += self.molecule_energy(system, i).await;
+    /// Compute total system energy (inter-molecular only)
+    pub async fn total_energy(&mut self, system: &System) -> f64 {
+        if !self.cache_initialized {
+            self.initialize_cache(system).await;
         }
-        // Each pair counted twice (i-j and j-i), so divide by 2
-        total * 0.5
+        // Update any dirty molecules
+        for i in 0..self.n_molecules as usize {
+            if self.dirty[i] {
+                self.update_row(system, i).await;
+            }
+        }
+        // Sum all molecule energies and divide by 2 (each pair counted twice)
+        self.mol_energies.iter().sum::<f64>() * 0.5
     }
 
     /// Blocking version of total_energy
-    pub fn total_energy_blocking(&self, system: &System) -> f64 {
+    pub fn total_energy_blocking(&mut self, system: &System) -> f64 {
         pollster::block_on(self.total_energy(system))
     }
 }

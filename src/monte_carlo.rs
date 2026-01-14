@@ -69,6 +69,9 @@ impl MonteCarlo {
 
         let e_old = self.energy.molecule_energy(&self.system, i).await;
 
+        // Invalidate cache BEFORE moving so e_new is computed fresh
+        self.energy.invalidate_molecule(i);
+
         match move_type {
             MoveType::Translation => self.propose_translation(i),
             MoveType::Rotation => self.propose_rotation(i),
@@ -79,6 +82,8 @@ impl MonteCarlo {
         let accepted = self.metropolis(e_new - e_old);
 
         if accepted {
+            // Notify backend that molecule moved (GPU uses this to invalidate cache)
+            self.energy.notify_move_accepted(i);
             match move_type {
                 MoveType::Translation => self.trans_accepted += 1,
                 MoveType::Rotation => self.rot_accepted += 1,
@@ -89,6 +94,9 @@ impl MonteCarlo {
             mol.com = old_com;
             mol.orientation = old_q;
             mol.sites_lab = old_sites;
+
+            // Invalidate cache since we reverted positions (GPU cached wrong energy)
+            self.energy.invalidate_molecule(i);
 
             match move_type {
                 MoveType::Translation => self.trans_rejected += 1,
