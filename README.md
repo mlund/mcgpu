@@ -34,6 +34,7 @@ The cached backends use **pairwise energy caching** to avoid redundant calculati
 | 50 | 34,950 | 185.8 | 209.0 | 1.1x |
 | 100 | 69,900 | 88.7 | 130.6 | 1.5x |
 | 200 | 139,800 | 44.5 | 85.6 | 1.9x |
+| 400 | 279,600 | 15.8 | 51.5 | 3.3x |
 
 The GPU advantage increases with system size due to better parallelization of pairwise computations.
 
@@ -53,6 +54,7 @@ Both backends benefit significantly from caching:
 |-----------|----------|--------|-------------|
 | 100 | 35.4 steps/s | 130.6 steps/s | 3.7x |
 | 200 | 17.1 steps/s | 85.6 steps/s | 5.0x |
+| 400 | 7.7 steps/s | 51.5 steps/s | 6.7x |
 
 ### Caching Strategy
 
