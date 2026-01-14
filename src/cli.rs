@@ -6,10 +6,12 @@ use std::path::PathBuf;
 /// Energy calculation backend
 #[derive(Clone, Copy, Debug, Default, ValueEnum)]
 pub enum Backend {
-    /// GPU backend using wgpu
+    /// GPU backend with pairwise caching
     #[default]
     Gpu,
-    /// CPU backend with SIMD
+    /// GPU backend without caching (recomputes every call)
+    GpuUncached,
+    /// CPU backend with SIMD and pairwise caching
     Cpu,
 }
 

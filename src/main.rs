@@ -1,7 +1,7 @@
 use mc_simulator::{
     read_pqr_molecule, read_restart, write_pqr, write_restart,
     Args, Backend, CpuEnergyBackend, EnergyBackend, GpuEnergyBackend,
-    MonteCarlo, MoveType, System, Vec3,
+    GpuUncachedEnergyBackend, MonteCarlo, MoveType, System, Vec3,
 };
 use nalgebra::UnitQuaternion;
 use std::sync::Arc;
@@ -73,13 +73,18 @@ async fn run(args: Args) {
             let gpu = GpuEnergyBackend::new_async(&system, args.cutoff as f32).await;
             EnergyBackend::Gpu(gpu)
         }
+        Backend::GpuUncached => {
+            let gpu = GpuUncachedEnergyBackend::new_async(&system, args.cutoff as f32).await;
+            EnergyBackend::GpuUncached(gpu)
+        }
         Backend::Cpu => {
             let cpu = CpuEnergyBackend::new(args.cutoff as f32);
             EnergyBackend::Cpu(cpu)
         }
     };
     match &energy {
-        EnergyBackend::Gpu(_) => println!("Using GPU backend"),
+        EnergyBackend::Gpu(_) => println!("Using GPU backend (cached)"),
+        EnergyBackend::GpuUncached(_) => println!("Using GPU backend (uncached)"),
         EnergyBackend::Cpu(_) => println!("Using CPU/SIMD backend ({} threads)", rayon::current_num_threads()),
     }
 
