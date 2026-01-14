@@ -13,11 +13,12 @@
 
 ### Overview
 
-The Monte Carlo simulator supports two energy calculation backends:
-- **CPU/SIMD**: Parallel computation using SIMD (ARM NEON/x86 SSE) with Rayon thread pool
-- **GPU**: Compute shader via wgpu
+The Monte Carlo simulator supports three energy calculation backends:
+- **GPU (cached)**: Compute shader via wgpu with pairwise energy caching (default)
+- **GPU (uncached)**: Compute shader without caching, for benchmarking
+- **CPU/SIMD**: Parallel computation using SIMD (ARM NEON/x86 SSE) with Rayon and caching
 
-Both backends use **pairwise energy caching** to avoid redundant calculations.
+The cached backends use **pairwise energy caching** to avoid redundant calculations.
 
 ### Benchmark Configuration
 
@@ -31,8 +32,8 @@ Both backends use **pairwise energy caching** to avoid redundant calculations.
 | Molecules | Atoms | CPU (steps/s) | GPU (steps/s) | GPU Speedup |
 |-----------|-------|---------------|---------------|-------------|
 | 50 | 34,950 | 185.8 | 209.0 | 1.1x |
-| 100 | 69,900 | 88.7 | 118.7 | 1.3x |
-| 200 | 139,800 | 44.5 | 82.1 | 1.8x |
+| 100 | 69,900 | 88.7 | 130.6 | 1.5x |
+| 200 | 139,800 | 44.5 | 85.6 | 1.9x |
 
 The GPU advantage increases with system size due to better parallelization of pairwise computations.
 
@@ -48,9 +49,10 @@ Both backends benefit significantly from caching:
 | 200 | 23.6 steps/s | 44.5 steps/s | 1.9x |
 
 #### GPU Backend
-| Molecules | Before Caching | After Caching | Improvement |
-|-----------|----------------|---------------|-------------|
-| 100 | 35 steps/s | 118.7 steps/s | 3.4x |
+| Molecules | Uncached | Cached | Improvement |
+|-----------|----------|--------|-------------|
+| 100 | 35.4 steps/s | 130.6 steps/s | 3.7x |
+| 200 | 17.1 steps/s | 85.6 steps/s | 5.0x |
 
 ### Caching Strategy
 
@@ -137,11 +139,14 @@ The GPU backend (`src/gpu.rs`) uses:
 ### Usage
 
 ```bash
-# CPU backend (default threads = all available)
-cargo run --release -- -n 10000 --n-molecules 100 --backend cpu
-
-# GPU backend
+# GPU backend with caching (default)
 cargo run --release -- -n 10000 --n-molecules 100 --backend gpu
+
+# GPU backend without caching (for comparison)
+cargo run --release -- -n 10000 --n-molecules 100 --backend gpu-uncached
+
+# CPU backend with caching
+cargo run --release -- -n 10000 --n-molecules 100 --backend cpu
 
 # CPU with specific thread count
 cargo run --release -- -n 10000 --n-molecules 100 --backend cpu --threads 4
