@@ -1,0 +1,16 @@
+[package]
+name = "mc_simulator"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+nalgebra = "0.33"
+wgpu = "24"
+bytemuck = { version = "1.14", features = ["derive"] }
+rand = { version = "0.8", features = ["small_rng"] }
+rand_distr = "0.4"
+futures = "0.3"
+pollster = "0.4"
+clap = { version = "4", features = ["derive"] }
+wide = "0.7"
+rayon = "1.10"
