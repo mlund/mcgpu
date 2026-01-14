@@ -120,7 +120,7 @@ impl MonteCarlo {
         let new_com = {
             let mol = &mut self.system.molecules[i];
             mol.com += mag * Vec3::from_row_slice(&dir);
-            mol.com.clone()
+            mol.com
         };
 
         let wrapped = self.system.wrap_pbc(new_com);

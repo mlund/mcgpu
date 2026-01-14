@@ -21,6 +21,7 @@ pub struct GpuEnergyBackend {
 
     // Buffers for pairwise computation
     all_positions: wgpu::Buffer,
+    #[allow(dead_code)] // Used by GPU bind group, not read by Rust
     all_params: wgpu::Buffer,
     pairwise_output: wgpu::Buffer,
     pairwise_staging: wgpu::Buffer,
@@ -266,9 +267,7 @@ impl GpuEnergyBackend {
         let n = self.n_molecules as usize;
         for i in 0..n {
             let row = self.compute_row(system, i).await;
-            for j in 0..n {
-                self.pairwise_cache[i * n + j] = row[j];
-            }
+            self.pairwise_cache[i * n..(i + 1) * n].copy_from_slice(&row);
             self.mol_energies[i] = row.iter().sum();
             self.dirty[i] = false;
         }
