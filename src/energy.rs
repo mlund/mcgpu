@@ -41,7 +41,7 @@ impl EnergyBackend {
     pub fn invalidate_molecule(&mut self, mol_idx: usize) {
         match self {
             EnergyBackend::Gpu(gpu) => gpu.invalidate_molecule(mol_idx),
-            EnergyBackend::Cpu(_) => {} // no-op for CPU
+            EnergyBackend::Cpu(cpu) => cpu.invalidate_molecule(mol_idx),
         }
     }
 

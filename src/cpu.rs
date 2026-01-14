@@ -1,67 +1,164 @@
-//! CPU/SIMD backend for energy calculations
+//! CPU/SIMD backend for energy calculations with pairwise caching
 
 use crate::types::{SiteParams, System};
 use rayon::prelude::*;
 use wide::{f32x4, CmpGt, CmpLt};
 
-/// CPU backend for computing interaction energies using SIMD
+/// CPU backend for computing interaction energies using SIMD with pairwise caching
 pub struct CpuEnergyBackend {
     cutoff_sq: f32,
+
+    // Cache: pairwise[i * n_molecules + j] = E_ij
+    pairwise_cache: Vec<f64>,
+    // Cached molecule energies (row sums)
+    mol_energies: Vec<f64>,
+    // Track which molecules need recomputation
+    dirty: Vec<bool>,
+    cache_initialized: bool,
+    n_molecules: usize,
 }
 
 impl CpuEnergyBackend {
     pub fn new(cutoff: f32) -> Self {
         Self {
             cutoff_sq: cutoff * cutoff,
+            pairwise_cache: Vec::new(),
+            mol_energies: Vec::new(),
+            dirty: Vec::new(),
+            cache_initialized: false,
+            n_molecules: 0,
         }
     }
 
+    /// Initialize cache by computing all pairwise energies
+    fn initialize_cache(&mut self, system: &System) {
+        let n = system.n_molecules();
+        self.n_molecules = n;
+        self.pairwise_cache = vec![0.0; n * n];
+        self.mol_energies = vec![0.0; n];
+        self.dirty = vec![false; n];
+
+        // Compute all pairwise energies in parallel
+        let pairwise: Vec<f64> = (0..n)
+            .into_par_iter()
+            .flat_map(|i| {
+                (0..n)
+                    .map(|j| {
+                        if i == j {
+                            0.0
+                        } else {
+                            self.compute_pair_energy(system, i, j)
+                        }
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+
+        self.pairwise_cache = pairwise;
+
+        // Compute row sums
+        for i in 0..n {
+            self.mol_energies[i] = (0..n).map(|j| self.pairwise_cache[i * n + j]).sum();
+        }
+
+        self.cache_initialized = true;
+    }
+
+    /// Update cache for a single molecule that moved
+    fn update_row(&mut self, system: &System, mol_i: usize) {
+        let n = self.n_molecules;
+
+        // Save old row values
+        let old_row: Vec<f64> = (0..n)
+            .map(|j| self.pairwise_cache[mol_i * n + j])
+            .collect();
+
+        // Compute new row in parallel
+        let new_row: Vec<f64> = (0..n)
+            .into_par_iter()
+            .map(|j| {
+                if j == mol_i {
+                    0.0
+                } else {
+                    self.compute_pair_energy(system, mol_i, j)
+                }
+            })
+            .collect();
+
+        // Update cache
+        for j in 0..n {
+            let old_val = old_row[j];
+            let new_val = new_row[j];
+            let delta = new_val - old_val;
+
+            // Update row i
+            self.pairwise_cache[mol_i * n + j] = new_val;
+            // Update column i (symmetry: E_ji = E_ij)
+            self.pairwise_cache[j * n + mol_i] = new_val;
+
+            // Update affected molecule energies
+            if j != mol_i {
+                self.mol_energies[j] += delta;
+            }
+        }
+
+        // Recalculate energy for molecule i
+        self.mol_energies[mol_i] = new_row.iter().sum();
+        self.dirty[mol_i] = false;
+    }
+
     /// Compute interaction energy of molecule `mol_idx` with all other molecules
-    pub fn molecule_energy(&self, system: &System, mol_idx: usize) -> f64 {
+    pub fn molecule_energy(&mut self, system: &System, mol_idx: usize) -> f64 {
+        if !self.cache_initialized {
+            self.initialize_cache(system);
+        } else if self.dirty[mol_idx] {
+            self.update_row(system, mol_idx);
+        }
+        self.mol_energies[mol_idx]
+    }
+
+    /// Invalidate cache for molecule that is about to move
+    pub fn invalidate_molecule(&mut self, mol_idx: usize) {
+        if self.cache_initialized {
+            self.dirty[mol_idx] = true;
+        }
+    }
+
+    /// Compute total system energy (inter-molecular only)
+    pub fn total_energy(&mut self, system: &System) -> f64 {
+        if !self.cache_initialized {
+            self.initialize_cache(system);
+        }
+        // Update any dirty molecules
+        for i in 0..self.n_molecules {
+            if self.dirty[i] {
+                self.update_row(system, i);
+            }
+        }
+        // Sum all molecule energies and divide by 2 (each pair counted twice)
+        self.mol_energies.iter().sum::<f64>() * 0.5
+    }
+
+    /// Compute energy between two molecules using SIMD
+    fn compute_pair_energy(&self, system: &System, mol_i: usize, mol_j: usize) -> f64 {
         let mol_type = &system.mol_type;
-        let mol = &system.molecules[mol_idx];
+        let sites_i = &system.molecules[mol_i].sites_lab;
+        let sites_j = &system.molecules[mol_j].sites_lab;
         let box_len = system.box_length as f32;
 
-        // Collect other molecules' sites into flat arrays for better cache access
-        let other_sites: Vec<[f32; 4]> = system
-            .molecules
+        // Sum over all site pairs between molecules i and j
+        sites_i
             .iter()
             .enumerate()
-            .filter(|(j, _)| *j != mol_idx)
-            .flat_map(|(_, m)| m.sites_lab.iter().copied())
-            .collect();
-
-        let other_params: Vec<SiteParams> = system
-            .molecules
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != mol_idx)
-            .flat_map(|_| mol_type.site_params.iter().copied())
-            .collect();
-
-        // Parallel over sites in molecule i
-        mol.sites_lab
-            .par_iter()
-            .enumerate()
-            .map(|(site_i, pos_i)| {
-                let par_i = &mol_type.site_params[site_i];
-                self.site_energy(pos_i, par_i, &other_sites, &other_params, box_len)
+            .map(|(si, pos_i)| {
+                let par_i = &mol_type.site_params[si];
+                self.site_pair_energy(pos_i, par_i, sites_j, &mol_type.site_params, box_len)
             })
             .sum()
     }
 
-    /// Compute total system energy (inter-molecular only)
-    pub fn total_energy(&self, system: &System) -> f64 {
-        let mut total = 0.0;
-        for i in 0..system.n_molecules() {
-            total += self.molecule_energy(system, i);
-        }
-        // Each pair counted twice, divide by 2
-        total * 0.5
-    }
-
-    /// Compute energy of one site with all other sites using SIMD
-    fn site_energy(
+    /// Compute energy of one site with all sites in another molecule using SIMD
+    fn site_pair_energy(
         &self,
         pos_i: &[f32; 4],
         par_i: &SiteParams,
@@ -109,12 +206,16 @@ impl CpuEnergyBackend {
             // Load parameters for 4 sites
             let base = chunk_idx * 4;
             let eps_j = f32x4::new([
-                other_params[base].epsilon, other_params[base + 1].epsilon,
-                other_params[base + 2].epsilon, other_params[base + 3].epsilon,
+                other_params[base].epsilon,
+                other_params[base + 1].epsilon,
+                other_params[base + 2].epsilon,
+                other_params[base + 3].epsilon,
             ]);
             let sig_j = f32x4::new([
-                other_params[base].sigma, other_params[base + 1].sigma,
-                other_params[base + 2].sigma, other_params[base + 3].sigma,
+                other_params[base].sigma,
+                other_params[base + 1].sigma,
+                other_params[base + 2].sigma,
+                other_params[base + 3].sigma,
             ]);
 
             // Lorentz-Berthelot combining rules
@@ -141,7 +242,8 @@ impl CpuEnergyBackend {
 
         // Handle remainder with scalar code
         for j in remainder_start..other_sites.len() {
-            total += self.scalar_pair_energy(pos_i, par_i, &other_sites[j], &other_params[j], box_len);
+            total +=
+                self.scalar_pair_energy(pos_i, par_i, &other_sites[j], &other_params[j], box_len);
         }
 
         total

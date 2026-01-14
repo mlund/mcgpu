@@ -4,7 +4,9 @@
 
 The Monte Carlo simulator supports two energy calculation backends:
 - **CPU/SIMD**: Parallel computation using SIMD (ARM NEON/x86 SSE) with Rayon thread pool
-- **GPU**: Compute shader via wgpu with pairwise energy caching
+- **GPU**: Compute shader via wgpu
+
+Both backends use **pairwise energy caching** to avoid redundant calculations.
 
 ## Benchmark Configuration
 
@@ -17,11 +19,62 @@ The Monte Carlo simulator supports two energy calculation backends:
 
 | Molecules | Atoms | CPU (steps/s) | GPU (steps/s) | GPU Speedup |
 |-----------|-------|---------------|---------------|-------------|
-| 50 | 34,950 | 97.0 | 209.0 | 2.2x |
-| 100 | 69,900 | 47.7 | 118.7 | 2.5x |
-| 200 | 139,800 | 23.6 | 82.1 | 3.5x |
+| 50 | 34,950 | 185.8 | 209.0 | 1.1x |
+| 100 | 69,900 | 88.7 | 118.7 | 1.3x |
+| 200 | 139,800 | 44.5 | 82.1 | 1.8x |
 
-The GPU advantage increases with system size due to better amortization of dispatch overhead.
+The GPU advantage increases with system size due to better parallelization of pairwise computations.
+
+## Impact of Pairwise Caching
+
+Both backends benefit significantly from caching:
+
+### CPU Backend
+| Molecules | Before Caching | After Caching | Improvement |
+|-----------|----------------|---------------|-------------|
+| 50 | 97.0 steps/s | 185.8 steps/s | 1.9x |
+| 100 | 47.7 steps/s | 88.7 steps/s | 1.9x |
+| 200 | 23.6 steps/s | 44.5 steps/s | 1.9x |
+
+### GPU Backend
+| Molecules | Before Caching | After Caching | Improvement |
+|-----------|----------------|---------------|-------------|
+| 100 | 35 steps/s | 118.7 steps/s | 3.4x |
+
+## Caching Strategy
+
+Both backends use identical caching logic:
+
+### Cache Structure
+- **Pairwise matrix**: N×N array storing E_ij (energy between molecules i and j)
+- **Molecule energies**: Cached row sums for O(1) lookup
+- **Dirty flags**: Track which molecules need recomputation
+
+### Algorithm
+
+1. **Initialization**: Compute full N×N pairwise matrix
+
+2. **Per MC step**:
+   - Get `e_old` from cache: **O(1) lookup**
+   - Invalidate moved molecule's cache entry
+   - Propose move, update positions
+   - Get `e_new` by recomputing one matrix row: **O(N) pairwise calculations**
+   - Accept/reject via Metropolis criterion
+   - If rejected: invalidate cache, revert positions
+
+3. **Cache update on acceptance**:
+   - New row values update both row i and column i (symmetry: E_ij = E_ji)
+   - All affected molecule energies updated incrementally
+
+### Complexity Reduction
+
+| Operation | Without Cache | With Cache |
+|-----------|---------------|------------|
+| Get e_old | O(N × sites²) | O(1) |
+| Get e_new | O(N × sites²) | O(N × sites²) |
+| **Per step** | **2 × O(N × sites²)** | **O(N × sites²)** |
+
+The cache eliminates redundant computation of e_old, halving the work per step.
 
 ## CPU Backend Implementation
 
@@ -32,13 +85,13 @@ The CPU backend (`src/cpu.rs`) uses:
    - Processes 4 site pairs per SIMD instruction
 
 2. **Parallel Iteration**: Rayon for multi-threaded computation
-   - Parallelizes over sites within each molecule
+   - Parallelizes pairwise energy calculations across molecules
    - Scales with available CPU cores
 
-3. **On-demand Calculation**: No caching; energies computed fresh each call
+3. **Pairwise Caching**: Same strategy as GPU backend
 
 ```
-Thread scaling (100 molecules):
+Thread scaling (100 molecules, without caching):
 - 1 thread:  9.6 steps/s
 - 4 threads: 35.7 steps/s (3.7x)
 - 10 threads: 51.1 steps/s (5.3x)
@@ -46,57 +99,28 @@ Thread scaling (100 molecules):
 
 ## GPU Backend Implementation
 
-The GPU backend (`src/gpu.rs`) uses a **pairwise energy caching** strategy:
+The GPU backend (`src/gpu.rs`) uses:
 
-### Cache Structure
-- **Pairwise matrix**: N×N array storing E_ij (energy between molecules i and j)
-- **Molecule energies**: Cached row sums for O(1) lookup
-- **Dirty flags**: Track which molecules need recomputation
+1. **Compute Shaders**: wgpu with WGSL shaders
+   - One workgroup per target molecule
+   - Parallel reduction within workgroup
 
-### Algorithm
-
-1. **Initialization**: Compute full N×N pairwise matrix (N GPU dispatches)
-
-2. **Per MC step**:
-   - Get `e_old` from cache (O(1) lookup)
-   - Invalidate moved molecule's cache entry
-   - Propose move, update positions
-   - Get `e_new` by recomputing one matrix row (1 GPU dispatch)
-   - Accept/reject via Metropolis criterion
-   - If rejected: invalidate cache, revert positions
-
-3. **Cache update on acceptance**:
-   - New row values update both row i and column i (symmetry: E_ij = E_ji)
-   - All affected molecule energies updated incrementally
-
-### GPU Dispatch Efficiency
-
-| Approach | GPU Dispatches per Step | Synchronizations |
-|----------|------------------------|------------------|
-| Naive (before) | 2 | 2 |
-| Cached (after) | ~1 (only if dirty) | ~1 |
-
-The caching reduced GPU synchronization overhead by computing N pairwise energies per dispatch instead of summing all interactions.
-
-### Performance Improvement from Caching
-
-With 100 molecules:
-- **Before caching**: 35 steps/s
-- **After caching**: 119 steps/s
-- **Improvement**: 3.4x faster
+2. **Pairwise Caching**: Reduces GPU dispatches from 2 to ~1 per step
+   - Eliminates synchronization overhead for e_old lookup
 
 ## Memory Usage
 
 | Component | Size (100 molecules) |
 |-----------|---------------------|
 | Pairwise cache | 80 KB (N² × 8 bytes) |
-| Position buffer | 1.1 MB (N × 699 × 16 bytes) |
+| Position buffer (GPU) | 1.1 MB (N × 699 × 16 bytes) |
 | Parameter buffer | 16.8 KB (699 × 24 bytes) |
 
 ## Recommendations
 
-- **Small systems (< 50 molecules)**: CPU backend preferred due to lower overhead
-- **Large systems (> 100 molecules)**: GPU backend provides significant speedup
+- **Small systems (< 50 molecules)**: CPU and GPU perform similarly
+- **Large systems (> 100 molecules)**: GPU provides increasing speedup
+- **Memory-constrained**: CPU backend uses less GPU memory
 - **CPU thread count**: Use all available cores (`--threads 0`) for best performance
 
 ## Usage
