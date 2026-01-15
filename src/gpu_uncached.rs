@@ -83,7 +83,7 @@ impl GpuUncachedEnergyBackend {
         let n_mol = system.n_molecules() as u32;
         let n_other_sites = (n_mol - 1) * n_sites;
         let workgroup_size = 256u32;
-        let n_workgroups = (n_sites + workgroup_size - 1) / workgroup_size;
+        let n_workgroups = n_sites.div_ceil(workgroup_size);
 
         // Position buffer for molecule being evaluated
         let positions_i = device.create_buffer(&wgpu::BufferDescriptor {
@@ -247,7 +247,7 @@ impl GpuUncachedEnergyBackend {
             cutoff_sq: self.cutoff_sq,
         };
 
-        let n_workgroups = (self.n_sites_per_mol + self.workgroup_size - 1) / self.workgroup_size;
+        let n_workgroups = self.n_sites_per_mol.div_ceil(self.workgroup_size);
 
         // Encode and submit
         let mut encoder = self
