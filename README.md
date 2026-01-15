@@ -38,6 +38,16 @@ The cached backends use **pairwise energy caching** to avoid redundant calculati
 
 The GPU advantage increases with system size due to better parallelization of pairwise computations.
 
+### All Backends Comparison
+
+| Backend | 100 mol | 200 mol | 400 mol |
+|---------|---------|---------|---------|
+| cpu | 67.7 | 26.3 | 8.8 |
+| gpu-uncached | 33.9 | 18.0 | 9.0 |
+| gpu | 127.6 | 68.8 | 32.7 |
+
+Run `python3 benchmark.py [steps]` to reproduce.
+
 ### Impact of Pairwise Caching
 
 Both backends benefit significantly from caching:
